@@ -107,6 +107,19 @@ export function drawPerf(canvas, state, p, macroValues, info) {
   ctx.fillText(info.subtitle, 22, 52);
   ctx.fillText(info.keys, 22, h - 22);
 
+  const corridor = info.corridor;
+  ctx.textAlign = 'right';
+  ctx.fillStyle = corridor.pendingSide ? MACROS.energy.color : 'rgba(255,255,255,0.58)';
+  ctx.font = '500 11px ui-monospace, monospace';
+  ctx.fillText(corridor.ready
+    ? `CORRIDOR  A ${String(Math.round(corridor.position * 100)).padStart(3)}% B`
+    : 'CORRIDOR  CAPTURE B', w - 22, 34);
+  ctx.fillStyle = 'rgba(255,255,255,0.28)';
+  ctx.font = '10px ui-monospace, monospace';
+  ctx.fillText(corridor.pendingSide
+    ? `${corridor.pendingSide.toUpperCase()} queued for bar boundary`
+    : `${corridor.appliedSide.toUpperCase()} topology active`, w - 22, 52);
+
   // macro readouts stacked bottom-right, each with its ring's colour
   ctx.textAlign = 'right';
   keys.forEach((key, i) => {

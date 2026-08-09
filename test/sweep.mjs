@@ -11,6 +11,9 @@ import { SLOPE_PRESETS, gapStats, detectPeriod } from '../src/quasilattice.js';
 import { effectiveRates, convertRates, snapToLadder, closure, barSeconds, RATE_LADDER } from '../src/tempo.js';
 import { clocksPerCell, positionFromClock, clockFromSongPosition, bpmFromTickMs, tickMsFromBpm, updateTickEstimate, CLOCKS_PER_BAR } from '../src/clock.js';
 import { MidiIn } from '../src/output.js';
+import { createTransportController, TRANSPORT_TICK_MS } from '../src/transport.js';
+import { createClockController } from '../src/clock-controller.js';
+import { createCorridorController, corridorDifferences, interpolateCorridor } from '../src/corridor.js';
 
 const PHI = (1 + Math.sqrt(5)) / 2;
 import { writeMidiFile } from '../src/midifile.js';
@@ -532,6 +535,192 @@ console.log('\nmacros (two-knob performance):');
   const leaked = [...changed].filter((k) => !allowed.has(k));
   ok(leaked.length === 0, `macros leaked into ${leaked.join(', ')}`);
   console.log(`  touches exactly ${changed.size} parameters, none outside the two clusters`);
+}
+
+// --- safe performance corridors -------------------------------------------
+console.log('\nsafe performance corridors:');
+{
+  const a = {
+    ...DEFAULT_PARAMS,
+    solid: 'cube',
+    scale: 'pentatonic',
+    customDegrees: [0, 2, 7],
+    density: 0.2,
+    eyeRadius: 2,
+    velMin: 30,
+    velMax: 90,
+    gridN: 8,
+  };
+  const b = {
+    ...a,
+    solid: 'icosahedron',
+    scale: 'wholetone',
+    customDegrees: [0, 2, 4, 6, 8, 10],
+    density: 0.8,
+    eyeRadius: 6,
+    velMin: 70,
+    velMax: 120,
+    gridN: 32,
+  };
+  let running = true;
+  const continuous = [];
+  const discrete = [];
+  const changes = [];
+  const corridor = createCorridorController({
+    initial: a,
+    isRunning: () => running,
+    onContinuous: (values) => continuous.push(values),
+    onDiscrete: (values, side) => discrete.push({ values, side }),
+    onChange: (state) => changes.push(state),
+  });
+
+  ok(!corridor.view().ready, 'corridor should wait for B');
+  corridor.capture('b', b);
+  ok(corridor.view().ready && corridor.view().appliedSide === 'b', 'capturing B did not arm the corridor');
+  b.customDegrees.push(12); // the captured endpoint must not retain caller-owned arrays
+
+  corridor.setPosition(0.25);
+  const interpolated = continuous.at(-1);
+  ok(Math.abs(interpolated.density - 0.35) < 1e-12, `corridor density ${interpolated.density}, expected 0.35`);
+  ok(Math.abs(interpolated.eyeRadius - 3) < 1e-12, `corridor radius ${interpolated.eyeRadius}, expected 3`);
+  ok(corridor.view().pendingSide === 'a' && discrete.length === 0,
+    'topology change was not queued while running');
+  ok(!corridor.flushAtStep(7, 8) && discrete.length === 0, 'corridor committed before the bar');
+  ok(corridor.flushAtStep(8, 8), 'corridor did not commit at the bar');
+  ok(discrete.at(-1).side === 'a' && discrete.at(-1).values.solid === 'cube', 'corridor committed the wrong A topology');
+  ok(!('gridN' in discrete.at(-1).values), 'corridor changed excluded transport state');
+
+  running = false;
+  corridor.setPosition(0.75);
+  ok(discrete.at(-1).side === 'b' && discrete.at(-1).values.solid === 'icosahedron',
+    'stopped corridor did not commit B immediately');
+  ok(JSON.stringify(discrete.at(-1).values.customDegrees) === '[0,2,4,6,8,10]',
+    'corridor endpoint did not clone list values');
+
+  const diff = corridorDifferences(a, b);
+  ok(diff.includes('solid') && diff.includes('scale') && !diff.includes('gridN'),
+    `corridor topology diff is wrong: ${diff.join(', ')}`);
+  const clamped = interpolateCorridor(a, b, 2);
+  ok(clamped.density === b.density && clamped.eyeRadius === b.eyeRadius,
+    'corridor position did not clamp to B');
+  ok(changes.length >= 3, 'corridor did not report state changes');
+  console.log(`  A→B: ${diff.length} topology changes, continuous values interpolate, commits land exactly on a bar`);
+}
+
+// --- runtime controllers ---------------------------------------------------
+console.log('\nruntime controllers:');
+{
+  const q = {
+    ...DEFAULT_PARAMS,
+    ...SPEC_LITERAL,
+    gridN: 16,
+    bars: 1,
+    gate: 0.5,
+  };
+  let nowMs = 1000;
+  const timerCalls = [];
+  const cleared = [];
+  const playing = [];
+  const beforeSteps = [];
+  const midiSent = [];
+  const synthSent = [];
+  const midiSink = {
+    port: {},
+    panics: 0,
+    send: (...args) => midiSent.push(args),
+    panic() { this.panics++; },
+  };
+  const synthSink = {
+    panics: 0,
+    send: (...args) => synthSent.push(args),
+    panic() { this.panics++; },
+  };
+  const transportController = createTransportController({
+    params: q,
+    midi: midiSink,
+    synth: synthSink,
+    previewEnabled: () => true,
+    now: () => nowMs,
+    lookaheadMs: () => 1000,
+    setIntervalFn: (fn, ms) => { const timer = { fn, ms }; timerCalls.push(timer); return timer; },
+    clearIntervalFn: (timer) => cleared.push(timer),
+    beforeStep: ({ stepIndex }) => beforeSteps.push(stepIndex),
+    onPlayingChange: (value) => playing.push(value),
+  });
+
+  transportController.start();
+  ok(transportController.state.playing, 'transport controller did not start');
+  ok(timerCalls.length === 1 && timerCalls[0].ms === TRANSPORT_TICK_MS,
+    `transport timer is not ${TRANSPORT_TICK_MS} ms`);
+  ok(midiSent.length > 0, 'transport controller scheduled no MIDI');
+  ok(beforeSteps.length > 0 && beforeSteps[0] === 0, 'transport did not expose the first scheduling boundary');
+  ok(midiSent.length === synthSent.length, 'transport sinks received different event counts');
+  ok(midiSent.every((args) => args[3] >= 1000), 'transport scheduled an event in the past');
+
+  nowMs += 125;
+  transportController.stop();
+  ok(!transportController.state.playing && transportController.state.pausedAt === 125,
+    `transport pause position ${transportController.state.pausedAt}, expected 125`);
+  ok(cleared.length === 1 && midiSink.panics === 1 && synthSink.panics === 1,
+    'transport stop did not clear timer and panic both sinks');
+  ok(JSON.stringify(playing) === '[true,false]', `transport play notifications ${JSON.stringify(playing)}`);
+  console.log(`  internal: ${midiSent.length} timestamped events, deterministic pause at ${transportController.state.pausedAt} ms`);
+
+  const clockMidi = {
+    port: {},
+    sent: [],
+    panics: 0,
+    send(...args) { this.sent.push(args); },
+    panic() { this.panics++; },
+  };
+  const clockSynth = {
+    sent: [],
+    panics: 0,
+    send(...args) { this.sent.push(args); },
+    panic() { this.panics++; },
+  };
+  const transportStub = {
+    state: { playing: true, pausedAt: 500 },
+    stops: 0,
+    stop() { this.stops++; this.state.playing = false; },
+    musicalTimeMs: () => 0,
+  };
+  const clockPlaying = [];
+  const clockBeforeSteps = [];
+  let clockNow = 2000;
+  const clockController = createClockController({
+    params: q,
+    transport: transportStub,
+    midi: clockMidi,
+    synth: clockSynth,
+    previewEnabled: () => true,
+    now: () => clockNow,
+    beforeStep: ({ stepIndex }) => clockBeforeSteps.push(stepIndex),
+    onPlayingChange: (value) => clockPlaying.push(value),
+  });
+
+  clockController.setExternal(true);
+  ok(transportStub.stops === 1 && transportStub.state.pausedAt === 0,
+    'external clock did not stop and rewind internal transport');
+  clockController.onTransport('start');
+  const tickMs = tickMsFromBpm(120);
+  for (let i = 0; i < CLOCKS_PER_BAR; i++) {
+    clockNow += tickMs;
+    clockController.onTick();
+  }
+  ok(clockController.state.count === CLOCKS_PER_BAR,
+    `external clock count ${clockController.state.count}, expected ${CLOCKS_PER_BAR}`);
+  ok(clockMidi.sent.length > 0, 'external clock scheduled no MIDI');
+  ok(clockBeforeSteps.length === q.gridN && clockBeforeSteps[0] === 0,
+    `external clock exposed ${clockBeforeSteps.length} cell boundaries, expected ${q.gridN}`);
+  ok(clockMidi.sent.length === clockSynth.sent.length, 'external clock sinks received different event counts');
+  ok(Math.abs(q.bpm - 120) < 1e-6, `external clock BPM drifted to ${q.bpm}`);
+  clockController.setSongPosition(16);
+  ok(clockController.state.count === CLOCKS_PER_BAR, 'clock controller song position is not one bar');
+  clockController.onTransport('stop');
+  ok(clockMidi.panics === 1 && clockSynth.panics === 1, 'external clock stop did not panic both sinks');
+  ok(clockPlaying.includes(true) && clockPlaying.at(-1) === false, 'external clock play state notifications wrong');
+  console.log(`  external: ${clockMidi.sent.length} timestamped events across one bar, BPM ${q.bpm.toFixed(2)}`);
 }
 
 // --- midi clock slaving ----------------------------------------------------

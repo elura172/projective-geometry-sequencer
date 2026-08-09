@@ -44,6 +44,25 @@ OSC output is not implemented: a browser cannot open a UDP socket, so it would
 need a local bridge process. The `.mid` and live-MIDI paths cover the spec's
 "at least one, ideally two".
 
+## Runtime architecture
+
+The browser entry point in [`src/main.js`](src/main.js) is the composition root:
+it owns DOM bindings, drawing, and the shared parameter state. Musical timing is
+kept outside that UI layer in two DOM-free controllers:
+
+- [`src/transport.js`](src/transport.js) schedules the internal clock with a
+  timestamped lookahead and owns play, pause, and reset state.
+- [`src/clock-controller.js`](src/clock-controller.js) follows external MIDI
+  clock, transport, and song-position messages from a DAW.
+
+Both controllers emit through the same MIDI and preview-synth sinks, and both
+sample the same pure sequencing engine in [`src/sequencer.js`](src/sequencer.js).
+Their clocks and timers are injected, so the full runtime behavior is exercised
+deterministically by [`test/sweep.mjs`](test/sweep.mjs), not only by browser UI.
+[`src/corridor.js`](src/corridor.js) sits above both clocks: it interpolates
+continuous patch values immediately and asks either scheduler to commit a queued
+topology bundle at the first unscheduled bar boundary.
+
 ## Deviations from the spec
 
 **Depth is measured along each eye's own view axis, not world z.** The spec's
@@ -270,7 +289,30 @@ period, or `waiting for MIDI clock` if nothing is arriving.
 eye, correct tempo, drag it straight in. With **Export passes** at 8× you get an
 evolving 16–32 bar take rather than one loop repeated.
 
-## Performance mode — two knobs
+## Safe corridors
+
+A corridor joins two patches without pretending that every point in parameter
+space is smooth. Capture **A**, shape another playable patch, capture **B**, then
+move the Morph control between them. `H` returns toward A from anywhere.
+
+Spatial and timbral values such as eye radius, gate, timing, density, lensing,
+and velocity range interpolate continuously. Values that can replace the note
+topology, including the solid, scale, voice count, pitch map, and rate family,
+switch together at a bar boundary. While playing, the interface says which side
+is active and whether a topology change is queued. The centre marker shows where
+that crossing occurs.
+
+Tempo, grid resolution, loop length, tempo-sync mode, and lattice slope are not
+part of a corridor. They define the clock and recurrence contract that the
+performance gesture runs inside. A preset clears B and makes the new patch A.
+
+The implementation deliberately commits at the first **unscheduled** bar. The
+timestamped lookahead may already have placed the immediately upcoming notes in
+Web MIDI, especially in a background tab; rewriting those events would require
+a panic and audible restart. The change therefore remains exact, but can wait
+one additional bar rather than interrupting a sounding phrase.
+
+## Performance mode, two knobs
 
 There are around forty parameters here, which is a patch, not an instrument.
 Performance mode borrows the monome Arc's premise: **two endless encoders and a

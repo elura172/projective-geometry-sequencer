@@ -1,6 +1,6 @@
 import { SOLID_NAMES, SOLIDS } from './geometry.js';
 import { EYE_COLORS } from './eyes.js';
-import { DEFAULT_PARAMS, SPEC_LITERAL, frameState, cellEvents, renderLoop, renderTake, latticeMask, stepSeconds, totalCells } from './sequencer.js';
+import { DEFAULT_PARAMS, SPEC_LITERAL, frameState, renderLoop, renderTake, latticeMask, stepSeconds, totalCells } from './sequencer.js';
 import { SLOPE_PRESETS, gapStats, detectPeriod } from './quasilattice.js';
 import { sweepRatio, impliedGM } from './kepler.js';
 import { PRESETS, PRESET_NAMES } from './presets.js';
@@ -11,7 +11,10 @@ import { drawViewport, drawCircle, drawGrid } from './render.js';
 import { MidiOut, MidiIn, PreviewSynth, downloadBytes } from './output.js';
 import { MACROS, MACRO_TARGETS, applyMacros, LOCK_ALPHA, FREE_ALPHA } from './macros.js';
 import { drawPerf } from './perf.js';
-import { clocksPerCell, positionFromClock, clockFromSongPosition, bpmFromTickMs, tickMsFromBpm, updateTickEstimate } from './clock.js';
+import { clocksPerCell, positionFromClock } from './clock.js';
+import { createTransportController } from './transport.js';
+import { createClockController } from './clock-controller.js';
+import { createCorridorController } from './corridor.js';
 
 const PHI = (1 + Math.sqrt(5)) / 2;
 const p = { ...DEFAULT_PARAMS };
@@ -52,6 +55,36 @@ function syncMacroUI() {
   $('lockToggle').textContent = `Lock: ${locked ? 'on' : 'off'}`;
 }
 
+function syncCorridorUI(current = corridor.view()) {
+  const morph = $('corridorMorph');
+  if (!morph) return;
+  morph.disabled = !current.ready;
+  morph.value = current.position;
+  morph.setAttribute('aria-valuetext', current.ready
+    ? `${Math.round(current.position * 100)} percent from A to B`
+    : 'Capture B to enable the corridor');
+  $('corridorMorph_v').textContent = current.ready
+    ? `${Math.round(current.position * 100)}%`
+    : 'set B';
+  $('corridorA').setAttribute('aria-pressed', String(current.appliedSide === 'a'));
+  $('corridorB').setAttribute('aria-pressed', String(current.appliedSide === 'b'));
+
+  const state = $('corridorState');
+  if (!current.ready) {
+    state.textContent = 'A is safe. Shape another patch, then capture B.';
+    state.dataset.state = 'setup';
+    return;
+  }
+  if (current.pendingSide) {
+    const count = current.discreteChanges.length;
+    state.textContent = `${count} topology change${count === 1 ? '' : 's'} queued for ${current.pendingSide.toUpperCase()} at a bar boundary.`;
+    state.dataset.state = 'queued';
+    return;
+  }
+  state.textContent = `Following ${current.appliedSide.toUpperCase()}. ${current.discreteChanges.length} topology change${current.discreteChanges.length === 1 ? '' : 's'} cross at centre.`;
+  state.dataset.state = 'ready';
+}
+
 function captureBase() {
   base = { ...p };
   unlockedAlpha = locked ? unlockedAlpha : p.alpha;
@@ -59,6 +92,23 @@ function captureBase() {
   macroValues.energy = 0.5;
   syncMacroUI();
   status('Captured — both knobs centred on this patch.');
+}
+
+function captureCorridorSide(side) {
+  base = { ...p };
+  unlockedAlpha = locked ? unlockedAlpha : p.alpha;
+  macroValues.space = 0.5;
+  macroValues.energy = 0.5;
+  corridor.capture(side, base);
+  syncControls();
+  syncMacroUI();
+  status(`Corridor ${side.toUpperCase()} captured. This endpoint is now home-safe.`);
+}
+
+function applyCorridorValues(values) {
+  Object.assign(base, values);
+  applyMacroState({ sync: !perfOpen() });
+  if (!perfOpen()) syncControls();
 }
 
 function nudgeMacro(key, delta) {
@@ -71,158 +121,49 @@ const perfOpen = () => !$('perf').hidden;
 const $ = (id) => document.getElementById(id);
 const status = (msg) => { $('status').textContent = msg; };
 
-// --- transport -------------------------------------------------------------
-// Lookahead scheduler on performance.now(): the same clock Web MIDI timestamps
-// use. Geometry is sampled once per grid step, never per animation frame.
-// Background tabs throttle setInterval to ~1s, which would starve a short
-// lookahead and drop notes. Both sinks send with absolute timestamps, so we
-// simply schedule further ahead when the page is hidden.
-const TICK_MS = 25;
-const lookaheadMs = () => (document.hidden ? 2200 : 140);
+// --- runtimes --------------------------------------------------------------
+// Geometry is sampled once per grid step. The internal transport schedules on
+// performance.now(); the external controller replaces it with MIDI clock.
+const corridor = createCorridorController({
+  initial: base,
+  isRunning: () => transport.state.playing || (clock.state.external && clock.state.running),
+  onContinuous: applyCorridorValues,
+  onDiscrete: applyCorridorValues,
+  onChange: (state) => syncCorridorUI(state),
+});
 
-const transport = {
-  playing: false, startMs: 0, pausedAt: 0,
-  nextCell: 0, nextStep: 0, nextTimeMs: 0, timer: null,
-};
+const transport = createTransportController({
+  params: p,
+  midi,
+  synth,
+  previewEnabled: () => $('preview').checked,
+  lookaheadMs: () => (document.hidden ? 2200 : 140),
+  beforeStep: ({ stepIndex }) => corridor.flushAtStep(stepIndex, p.gridN),
+  onPlayingChange: (playing) => { $('play').textContent = playing ? 'Pause' : 'Play'; },
+});
 
-function musicalTimeMs() {
-  return transport.playing ? performance.now() - transport.startMs : transport.pausedAt;
-}
-
-// --- external clock --------------------------------------------------------
-// When slaved, the DAW's timing clock replaces the internal scheduler entirely:
-// position is derived from the running tick count (so it cannot drift), and the
-// measured tick period drives p.bpm, so every duration downstream — step length,
-// gate, micro-timing offset, tempo-synced rotation — follows the DAW.
-const CLOCK_LATENCY_MS = 2;
-const clock = {
-  external: false, running: false,
-  count: 0,                     // timing clocks since song start
-  tickMs: tickMsFromBpm(120),
-  lastTickMs: 0, lastSeenMs: 0, ticks: 0,
-};
-
-const clockAlive = () => clock.external && clock.lastSeenMs && (performance.now() - clock.lastSeenMs) < 500;
-
-/** Seconds of geometry time — from the DAW's clock when slaved. */
-function geometrySeconds() {
-  return clock.external ? (clock.count * clock.tickMs) / 1000 : musicalTimeMs() / 1000;
-}
-
-function onClockTick() {
-  const now = performance.now();
-  if (clock.lastTickMs) clock.tickMs = updateTickEstimate(clock.tickMs, now - clock.lastTickMs);
-  clock.lastTickMs = now;
-  clock.lastSeenMs = now;
-  clock.ticks++;
-
-  const bpm = bpmFromTickMs(clock.tickMs);
-  if (isFinite(bpm) && bpm > 20 && bpm < 400) p.bpm = bpm;
-  if (!clock.external || !clock.running) return;
-
-  const cpc = clocksPerCell(p.gridN);
-  const pos = positionFromClock(clock.count, p.gridN, totalCells(p));
-  if (pos.onCell) {
-    const cellMs = clock.tickMs * cpc;
-    const t = geometrySeconds();
-    const events = cellEvents(p, t, pos.cell, pos.stepIndex);
-    const gateMs = cellMs * p.gate;
-    for (const e of events) {
-      const when = now + CLOCK_LATENCY_MS + (e.offset || 0) * cellMs;
-      if (midi.port) midi.send(e.channel, e.note, e.velocity, when, gateMs);
-      if ($('preview').checked) synth.send(e.channel, e.note, e.velocity, when, gateMs);
-    }
-  }
-  clock.count++;
-}
-
-function onClockTransport(kind) {
-  if (!clock.external) return;
-  if (kind === 'start') { clock.count = 0; clock.running = true; }
-  else if (kind === 'continue') { clock.running = true; }
-  else if (kind === 'stop') { clock.running = false; midi.panic(); synth.panic(); }
-  $('play').textContent = clock.running ? 'Pause' : 'Play';
-}
-
-function setClockSource(external) {
-  clock.external = external;
-  if (external) {
-    if (transport.playing) stopTransport();
-    transport.pausedAt = 0;
-    clock.running = false;
-    clock.count = 0;
-  } else {
-    clock.running = false;
-    midi.panic();
-    synth.panic();
-  }
-  $('play').disabled = external;
-}
-
-function startTransport() {
-  transport.playing = true;
-  transport.startMs = performance.now() - transport.pausedAt;
-  const stepMs = stepSeconds(p) * 1000;
-  const elapsedSteps = Math.ceil(transport.pausedAt / stepMs);
-  transport.nextCell = elapsedSteps % totalCells(p);
-  transport.nextStep = elapsedSteps; // absolute, never wraps: indexes the quasilattice
-  transport.nextTimeMs = transport.startMs + elapsedSteps * stepMs;
-  transport.timer = setInterval(schedule, TICK_MS);
-  schedule();
-  $('play').textContent = 'Pause';
-}
-
-function stopTransport() {
-  transport.pausedAt = musicalTimeMs();
-  transport.playing = false;
-  clearInterval(transport.timer);
-  transport.timer = null;
-  // flush both sinks, so nothing already queued inside the lookahead window
-  // sounds after the pause — and so resuming cannot double-schedule those cells
-  midi.panic();
-  synth.panic();
-  $('play').textContent = 'Play';
-}
-
-function resetTransport() {
-  const wasPlaying = transport.playing;
-  if (wasPlaying) stopTransport();
-  transport.pausedAt = 0;
-  if (wasPlaying) startTransport();
-}
-
-function schedule() {
-  const stepMs = stepSeconds(p) * 1000;
-  const gateMs = stepMs * p.gate;
-  const N = totalCells(p);
-  const horizon = performance.now() + lookaheadMs();
-
-  while (transport.nextTimeMs < horizon) {
-    const t = (transport.nextTimeMs - transport.startMs) / 1000; // geometry time
-    const events = cellEvents(p, t, transport.nextCell, transport.nextStep);
-    for (const e of events) {
-      const when = transport.nextTimeMs + (e.offset || 0) * stepMs;
-      if (midi.port) midi.send(e.channel, e.note, e.velocity, when, gateMs);
-      if ($('preview').checked) synth.send(e.channel, e.note, e.velocity, when, gateMs);
-    }
-    transport.nextCell = (transport.nextCell + 1) % N;
-    transport.nextStep += 1;
-    transport.nextTimeMs += stepMs;
-  }
-}
+const clock = createClockController({
+  params: p,
+  transport,
+  midi,
+  synth,
+  previewEnabled: () => $('preview').checked,
+  beforeStep: ({ stepIndex }) => corridor.flushAtStep(stepIndex, p.gridN),
+  onPlayingChange: (playing) => { $('play').textContent = playing ? 'Pause' : 'Play'; },
+});
 
 // --- draw loop -------------------------------------------------------------
 let cachedLoop = [];
 let lastLoopBuild = -1e9;
 
 function currentPlayCell() {
-  if (clock.external) return positionFromClock(clock.count, p.gridN, totalCells(p)).cell;
+  if (clock.state.external) return positionFromClock(clock.state.count, p.gridN, totalCells(p)).cell;
   const stepMs = stepSeconds(p) * 1000;
-  return Math.floor(musicalTimeMs() / stepMs) % totalCells(p);
+  return Math.floor(transport.musicalTimeMs() / stepMs) % totalCells(p);
 }
 
 function frame() {
-  const t = geometrySeconds();
+  const t = clock.geometrySeconds();
   const state = frameState(p, t);
   const cell = currentPlayCell();
 
@@ -231,9 +172,10 @@ function frame() {
       playCell: cell,
       title: `${p.solid} · ${p.nEyes} eyes · ${Math.round(p.bpm)} bpm · ${p.bars} bar${p.bars > 1 ? 's' : ''}`,
       subtitle: locked ? `locked — mask repeats every 8 steps` : `free — 1/φ, never repeats`,
-      keys: 'drag left/right half · ←→ space · ↑↓ energy · C capture · L lock · space play · esc exit',
+      keys: 'drag halves · arrows macros · [ ] corridor · H return A · C capture · L lock · space play · esc exit',
       bound: { space: midiIn.bindings.space?.cc, energy: midiIn.bindings.energy?.cc },
       learning: midiIn.learning,
+      corridor: corridor.view(),
     });
     requestAnimationFrame(frame);
     return;
@@ -265,9 +207,9 @@ function frame() {
     `play cell   ${cell}`,
     '',
   ];
-  if (clock.external) {
-    lines.push(clockAlive()
-      ? `clock in    ${clock.running ? 'RUNNING' : 'stopped'} · ${p.bpm.toFixed(2)} bpm from DAW · ${clocksPerCell(p.gridN)} clocks/cell · tick ${clock.tickMs.toFixed(2)} ms`
+  if (clock.state.external) {
+    lines.push(clock.alive()
+      ? `clock in    ${clock.state.running ? 'RUNNING' : 'stopped'} · ${p.bpm.toFixed(2)} bpm from DAW · ${clocksPerCell(p.gridN)} clocks/cell · tick ${clock.state.tickMs.toFixed(2)} ms`
       : `clock in    waiting for MIDI clock — press play in the DAW`);
   }
   if (p.tempoSync) {
@@ -344,7 +286,7 @@ function bindSelect(id, key, cast = (v) => v) {
   el.addEventListener('change', () => {
     p[key] = cast(el.value);
     lastLoopBuild = -1e9;
-    if (key === 'gridN' || key === 'bars' || key === 'bpm') resetTransport();
+    if (key === 'gridN' || key === 'bars' || key === 'bpm') transport.reset();
     if (key === 'nEyes') renderEyeLegend();
   });
 }
@@ -384,10 +326,18 @@ function renderEyeLegend() {
     `<span><i style="background:${EYE_COLORS[i]}"></i>eye ${i + 1} → ch ${i + 1}</span>`).join('');
 }
 
-function init() {
+function populateOptions() {
   $('solid').innerHTML = SOLID_NAMES
     .map((n) => `<option value="${n}">${n[0].toUpperCase()}${n.slice(1)}</option>`).join('');
 
+  $('alphaPreset').innerHTML = SLOPE_PRESETS
+    .map((s, i) => `<option value="${i}">${s.name}</option>`).join('');
+
+  $('preset').innerHTML = PRESET_NAMES
+    .map((n) => `<option value="${n}">${n}</option>`).join('');
+}
+
+function bindGeometryControls() {
   bindSelect('solid', 'solid');
   bindSelect('nEyes', 'nEyes', Number);
   bindSelect('projMode', 'projMode');
@@ -411,8 +361,23 @@ function init() {
   bindSelect('velocitySource', 'velocitySource');
   bindSelect('eyeRates', 'eyeRates');
 
-  $('alphaPreset').innerHTML = SLOPE_PRESETS
-    .map((s, i) => `<option value="${i}">${s.name}</option>`).join('');
+  $('specLiteral').addEventListener('click', () => {
+    Object.assign(p, SPEC_LITERAL);
+    syncControls();
+    status('Spec-literal: hard grid, no gating, angle-driven velocity, |Dz| depth.');
+  });
+
+  for (const id of CONTROLS.lists) {
+    $(id).addEventListener('input', (e) => {
+      p[id] = e.target.value.split(',').map((s) => parseInt(s.trim(), 10)).filter(Number.isFinite);
+      lastLoopBuild = -1e9;
+    });
+  }
+  bindRange('velMin', 'velMin', (v) => String(Math.round(v)));
+  bindRange('velMax', 'velMax', (v) => String(Math.round(v)));
+}
+
+function bindLatticeControls() {
   $('alphaPreset').addEventListener('change', (e) => {
     p.alpha = SLOPE_PRESETS[Number(e.target.value)].value;
     lastLoopBuild = -1e9;
@@ -424,25 +389,9 @@ function init() {
   bindRange('rho', 'rho');
   bindRange('phasonRate', 'phasonRate', (v) => v.toFixed(3));
   bindRange('eyeSpread', 'eyeSpread');
+}
 
-  $('specLiteral').addEventListener('click', () => {
-    Object.assign(p, SPEC_LITERAL);
-    syncControls();
-    status('Spec-literal: hard grid, no gating, angle-driven velocity, |Dz| depth.');
-  });
-
-  $('bpm').addEventListener('change', resetTransport);
-
-  for (const id of CONTROLS.lists) {
-    $(id).addEventListener('input', (e) => {
-      p[id] = e.target.value.split(',').map((s) => parseInt(s.trim(), 10)).filter(Number.isFinite);
-      lastLoopBuild = -1e9;
-    });
-  }
-  bindRange('velMin', 'velMin', (v) => String(Math.round(v)));
-  bindRange('velMax', 'velMax', (v) => String(Math.round(v)));
-
-  $('preset').innerHTML = PRESET_NAMES.map((n) => `<option value="${n}">${n}</option>`).join('');
+function bindPresetControls() {
   $('preset').addEventListener('change', (e) => {
     // presets are applied over DEFAULT_PARAMS so nothing leaks from the last one
     Object.assign(p, DEFAULT_PARAMS, PRESETS[e.target.value]);
@@ -452,12 +401,15 @@ function init() {
     base = { ...p };
     macroValues.space = 0.5;
     macroValues.energy = 0.5;
+    corridor.reset(base);
     syncControls();
     syncMacroUI();
-    resetTransport();
+    transport.reset();
     status(`Preset: ${e.target.value}`);
   });
+}
 
+function bindTempoControls() {
   // Toggling sync converts the stored rates so the motion you are hearing is
   // preserved — you land on the equivalent cycles-per-bar value and can then
   // round it to something that closes.
@@ -492,13 +444,18 @@ function init() {
     for (const k of ['wy', 'wz']) { $(k).value = p[k]; $(k + '_v').textContent = p[k].toFixed(3); }
     lastLoopBuild = -1e9;
   });
+}
 
+function bindTransportControls() {
+  $('bpm').addEventListener('change', () => transport.reset());
   $('play').addEventListener('click', () => {
-    if (transport.playing) stopTransport();
-    else { synth.ensure(); startTransport(); }
+    if (transport.state.playing) transport.stop();
+    else { synth.ensure(); transport.start(); }
   });
-  $('reset').addEventListener('click', resetTransport);
+  $('reset').addEventListener('click', () => transport.reset());
+}
 
+function bindMidiOutputControls() {
   $('connect').addEventListener('click', async () => {
     try {
       const ports = await midi.init();
@@ -517,17 +474,43 @@ function init() {
     midi.select(e.target.value);
     status(`MIDI out: ${midi.port ? midi.port.name : 'none'}`);
   });
+}
 
+function bindExportControls() {
   $('export').addEventListener('click', () => {
     const passes = Number($('passes').value) || 1;
-    const cells = renderTake(p, musicalTimeMs() / 1000, passes);
+    const cells = renderTake(p, transport.musicalTimeMs() / 1000, passes);
     const bytes = writeMidiFile(cells, { bpm: p.bpm, gridN: p.gridN, nEyes: p.nEyes, gate: p.gate });
     downloadBytes(bytes, `${p.solid}-${p.nEyes}eye-${p.bars}bar-x${passes}-${Math.round(p.bpm)}bpm.mid`);
     const n = cells.reduce((a, c) => a + c.length, 0);
     status(`Exported ${passes}× ${p.bars} bars = ${p.bars * passes} bars, ${n} notes, ${bytes.length} bytes.`);
   });
+}
 
-  // --- macro controls ------------------------------------------------------
+function nudgeCorridor(delta) {
+  const current = corridor.view();
+  if (!current.ready) {
+    status('Capture corridor B before morphing.');
+    return;
+  }
+  corridor.setPosition(current.position + delta);
+}
+
+function bindCorridorControls() {
+  $('corridorA').addEventListener('click', () => captureCorridorSide('a'));
+  $('corridorB').addEventListener('click', () => captureCorridorSide('b'));
+  $('corridorMorph').addEventListener('input', (event) => {
+    corridor.setPosition(parseFloat(event.target.value));
+  });
+  $('corridorHome').addEventListener('click', () => {
+    corridor.returnToA();
+    status(corridor.view().pendingSide
+      ? 'Return to A queued for a bar boundary.'
+      : 'Returned to corridor A.');
+  });
+}
+
+function bindMacroControls() {
   for (const [key, id] of [['space', 'mSpace'], ['energy', 'mEnergy']]) {
     $(id).addEventListener('input', (e) => {
       macroValues[key] = parseFloat(e.target.value);
@@ -540,9 +523,20 @@ function init() {
     applyMacroState();
     status(locked ? 'Locked — rational slope, the mask repeats every 8 steps.' : 'Free — 1/φ, never repeats.');
   });
+}
 
-  const enterPerf = () => { $('perf').hidden = false; $('perf').focus(); };
-  const exitPerf = () => { $('perf').hidden = true; syncControls(); syncMacroUI(); };
+function enterPerf() {
+  $('perf').hidden = false;
+  $('perf').focus();
+}
+
+function exitPerf() {
+  $('perf').hidden = true;
+  syncControls();
+  syncMacroUI();
+}
+
+function bindPerformanceControls() {
   $('perfMode').addEventListener('click', enterPerf);
 
   // drag: left half of the screen is Space, right half is Energy
@@ -567,7 +561,9 @@ function init() {
   const endDrag = () => { dragKey = null; };
   $('perf').addEventListener('pointerup', endDrag);
   $('perf').addEventListener('pointercancel', endDrag);
+}
 
+function bindMidiInputAndClock() {
   for (const [key, btn] of [['space', 'learnSpace'], ['energy', 'learnEnergy']]) {
     $(btn).addEventListener('click', async () => {
       try {
@@ -596,14 +592,15 @@ function init() {
         }
       } catch (err) { e.target.value = 'internal'; status(String(err.message || err)); return; }
     }
-    setClockSource(external);
+    clock.setExternal(external);
+    $('play').disabled = external;
     status(external
       ? 'External clock — the app now follows the DAW.\nIn Ableton: Settings → Link/Tempo/MIDI → Sync ON for the IAC output port.'
       : 'Internal clock — the app runs its own transport.');
   });
-  midiIn.onClock = onClockTick;
-  midiIn.onTransport = onClockTransport;
-  midiIn.onSongPosition = (sixteenths) => { clock.count = clockFromSongPosition(sixteenths); };
+  midiIn.onClock = () => clock.onTick();
+  midiIn.onTransport = (kind) => clock.onTransport(kind);
+  midiIn.onSongPosition = (sixteenths) => clock.setSongPosition(sixteenths);
   midiIn.onLearned = (key, cc, ch) => {
     status(`${key} bound to CC ${cc} on channel ${ch + 1}.`);
     $(key === 'space' ? 'learnSpace' : 'learnEnergy').textContent = `${key === 'space' ? 'Space' : 'Energy'}: cc${cc}`;
@@ -612,7 +609,9 @@ function init() {
     if (isDelta) nudgeMacro(key, v);
     else { macroValues[key] = v; applyMacroState({ sync: !perfOpen() }); if (perfOpen()) syncMacroUI(); }
   };
+}
 
+function bindKeyboardControls() {
   document.addEventListener('keydown', (e) => {
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
     const step = e.shiftKey ? 0.005 : 0.02;
@@ -624,14 +623,34 @@ function init() {
       case 'ArrowUp': e.preventDefault(); nudgeMacro('energy', step); break;
       case 'KeyC': captureBase(); break;
       case 'KeyL': $('lockToggle').click(); break;
+      case 'BracketLeft': e.preventDefault(); nudgeCorridor(e.shiftKey ? -0.01 : -0.05); break;
+      case 'BracketRight': e.preventDefault(); nudgeCorridor(e.shiftKey ? 0.01 : 0.05); break;
+      case 'KeyH': e.preventDefault(); $('corridorHome').click(); break;
       case 'KeyP': perfOpen() ? exitPerf() : enterPerf(); break;
       case 'Escape': if (perfOpen()) exitPerf(); break;
       default: break;
     }
   });
+}
+
+function init() {
+  populateOptions();
+  bindGeometryControls();
+  bindLatticeControls();
+  bindPresetControls();
+  bindTempoControls();
+  bindTransportControls();
+  bindMidiOutputControls();
+  bindExportControls();
+  bindCorridorControls();
+  bindMacroControls();
+  bindPerformanceControls();
+  bindMidiInputAndClock();
+  bindKeyboardControls();
 
   syncControls();
   syncMacroUI();
+  syncCorridorUI();
   window.addEventListener('pageshow', syncControls);
   status('Ready. Preview synth is on; Connect Web MIDI to drive a DAW\n(Chrome/Edge only, and macOS needs the IAC Driver enabled).');
   requestAnimationFrame(frame);

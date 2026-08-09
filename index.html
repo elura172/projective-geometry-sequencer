@@ -6,12 +6,14 @@
 <title>Projective Geometry Sequencer</title>
 <style>
   :root {
-    --bg: #07080c;
-    --panel: #0d1017;
-    --line: #1c2130;
-    --ink: #e6ecf7;
-    --dim: #8792a8;
-    --accent: #ffb454;
+    --bg: oklch(0.13 0.015 265);
+    --panel: oklch(0.17 0.018 265);
+    --line: oklch(0.25 0.025 265);
+    --control-line: oklch(0.52 0.035 265);
+    --ink: oklch(0.94 0.02 265);
+    --dim: oklch(0.65 0.04 265);
+    --accent: oklch(0.78 0.14 70);
+    --focus: oklch(0.78 0.12 225);
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
@@ -45,22 +47,41 @@
   label { display: grid; grid-template-columns: 88px 1fr 44px; align-items: center; gap: 8px; margin: 7px 0; color: var(--dim); font-size: 11px; }
   label > span:last-child { text-align: right; color: var(--ink); font: 11px ui-monospace, monospace; }
   select, input[type=text] {
-    grid-column: 2 / span 2; width: 100%; background: #12161f; color: var(--ink);
-    border: 1px solid var(--line); border-radius: 5px; padding: 4px 6px; font: 11px ui-monospace, monospace;
+    grid-column: 2 / span 2; width: 100%; background: oklch(0.20 0.025 265); color: var(--ink);
+    border: 1px solid var(--control-line); border-radius: 5px; padding: 4px 6px; font: 11px ui-monospace, monospace;
   }
   input[type=range] { width: 100%; accent-color: var(--accent); }
+  input[type=range]:disabled { opacity: .38; cursor: not-allowed; }
   input[type=checkbox] { justify-self: start; accent-color: var(--accent); }
   .btns { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 6px; }
   button {
-    background: #151a25; color: var(--ink); border: 1px solid var(--line);
+    background: oklch(0.22 0.03 265); color: var(--ink); border: 1px solid var(--control-line);
     border-radius: 6px; padding: 7px 8px; font: 500 11px ui-sans-serif, sans-serif; cursor: pointer;
   }
-  button:hover { border-color: #33405c; }
-  button.primary { background: var(--accent); color: #12100a; border-color: var(--accent); }
+  button:hover { border-color: oklch(0.62 0.05 265); }
+  button:active { background: oklch(0.26 0.035 265); }
+  button:disabled { color: var(--dim); cursor: not-allowed; opacity: .55; }
+  button:focus-visible, select:focus-visible, input:focus-visible {
+    outline: 2px solid var(--focus); outline-offset: 2px;
+  }
+  button.primary { background: var(--accent); color: oklch(0.18 0.03 70); border-color: var(--accent); }
   .wide { grid-column: 1 / -1; }
   #status { margin-top: 10px; color: var(--dim); font: 10px/1.5 ui-monospace, monospace; white-space: pre-wrap; }
   .legend { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 8px; font: 10px ui-monospace, monospace; }
   .legend i { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
+  .corridor-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .corridor-actions button[aria-pressed="true"] {
+    border-color: var(--accent); color: var(--accent);
+  }
+  .corridor-axis {
+    display: flex; justify-content: space-between; margin: -2px 44px 0 96px;
+    color: var(--dim); font: 9px/1 ui-monospace, monospace;
+  }
+  #corridorState {
+    min-height: 30px; margin: 8px 0; color: var(--dim);
+    font: 10px/1.5 ui-monospace, monospace;
+  }
+  #corridorState[data-state="queued"] { color: var(--accent); }
   /* performance mode: one focal point, nothing else on screen */
   #perf { position: fixed; inset: 0; background: var(--bg); z-index: 20; cursor: ns-resize; }
   #perf[hidden] { display: none; }
@@ -180,6 +201,18 @@
     <label>Vel min <input type="range" id="velMin" min="1" max="127" step="1"><span id="velMin_v"></span></label>
     <label>Vel max <input type="range" id="velMax" min="1" max="127" step="1"><span id="velMax_v"></span></label>
     <label>Show pitch <input type="checkbox" id="showPitch" checked><span></span></label>
+  </fieldset>
+
+  <fieldset id="corridorPanel">
+    <legend>Safe corridor</legend>
+    <div class="corridor-actions" role="group" aria-label="Capture corridor endpoints">
+      <button id="corridorA" type="button" aria-pressed="true">Capture A</button>
+      <button id="corridorB" type="button" aria-pressed="false">Capture B</button>
+    </div>
+    <label>Morph <input type="range" id="corridorMorph" min="0" max="1" step="0.002" disabled aria-describedby="corridorState"><span id="corridorMorph_v">set B</span></label>
+    <div class="corridor-axis" aria-hidden="true"><span>A</span><span>topology</span><span>B</span></div>
+    <div id="corridorState" role="status" aria-live="polite" data-state="setup">A is safe. Shape another patch, then capture B.</div>
+    <div class="btns"><button id="corridorHome" type="button" class="wide">Return to A <span aria-hidden="true">H</span></button></div>
   </fieldset>
 
   <fieldset>
