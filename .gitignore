@@ -1,0 +1,5 @@
+# MIDI files written by test/sweep.mjs
+test/out*.mid
+
+# macOS
+.DS_Store
